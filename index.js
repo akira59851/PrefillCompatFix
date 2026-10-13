@@ -28,11 +28,12 @@ const JSON_BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
 
 /* 默认保护名单：实际模型名包含任一配置项即命中；不区分大小写 */
 const MODEL_PATTERNS = [
-    /* Google Gemini：官方限制预填充的型号 */
+    /* Google Gemini */
     'gemini-3.5-flash-lite',
     'gemini-3.6-flash',
     'gemini-3.7-flash',
     'gemini-3.8-flash',
+    'gemini-4-argon',
 
     /* Anthropic Claude：4.6 及后续型号 */
     'claude-opus-4-6',

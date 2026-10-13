@@ -32,6 +32,7 @@
 - `gemini-3.6-flash`
 - `gemini-3.7-flash`
 - `gemini-3.8-flash`
+- `gemini-4-argon`
 
 ### Anthropic Claude
 
@@ -56,6 +57,10 @@
 添加时请注意代码格式，型号名称请按照实际填写，注意数字和连字符的写法。
 
 ## 更新日志
+
+### [v1.1.0] - 2026-10-14
+
+- 内置模型名单新增 `gemini-4-argon`。
 
 ### [v1.0.0] - 2026-10-11
 
