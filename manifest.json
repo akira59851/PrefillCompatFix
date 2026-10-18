@@ -3,7 +3,7 @@
     "loading_order": 1000,
     "js": "index.js",
     "author": "akira",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "debug_info": "在 index.js 顶部将 DEBUG_LOGS 改为 true 开启调试日志。",
     "repository": "https://github.com/akira59851/PrefillCompatFix",
     "description": "修复部分不支持预填充的模型导致的 400 报错，自动在请求末尾追加空格用户消息。"

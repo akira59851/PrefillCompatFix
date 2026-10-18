@@ -4,29 +4,32 @@
 
 /* 【区块索引】（按文件从上到下的顺序）
    1. 可调参数与常量     模型名单、占位内容、安装时机
-   2. 状态变量           挂钩状态与最近一次判断结果
-   3. 日志工具           统一日志前缀与级别
-   4. 基础工具           请求对象、URL、Header、模型名等纯函数
-   5. 模型名提取         按明确优先级收集候选并返回最终来源
-   6. 消息数组选择       在 messages / contents 之间做单目标选择
-   7. 请求体分析与修改   纯判断、追加 user、构造 modified init
-   8. Fetch 请求拦截     主窗口与同源 iframe 共用包装逻辑
-   9. XHR 请求拦截       open/send 包装与同步补全判定
-   10. Hook 安装         主窗口、同源 iframe、动态 iframe（fetch + XHR）
-   11. 调试接口          测试与排查用的 window.__PrefillCompatFix
-   12. 初始化            等待 ST 就绪后安装
+   2. 模型清单设置       用户自定义清单的存储、合并、弹窗与入口注入
+   3. 状态变量           挂钩状态与最近一次判断结果
+   4. 日志工具           统一日志前缀与级别
+   5. 基础工具           请求对象、URL、Header、模型名等纯函数
+   6. 模型名提取         按明确优先级收集候选并返回最终来源
+   7. 消息数组选择       在 messages / contents 之间做单目标选择
+   8. 请求体分析与修改   纯判断、追加 user、构造 modified init
+   9. Fetch 请求拦截     主窗口与同源 iframe 共用包装逻辑
+   10. XHR 请求拦截       open/send 包装与同步补全判定
+   11. Hook 安装         主窗口、同源 iframe、动态 iframe（fetch + XHR）
+   12. 调试接口          测试与排查用的 window.__PrefillCompatFix
+   13. 初始化            等待 ST 就绪后安装
    ============================================================ */
 
 /* ── 可调参数与常量 ───────────────────── */
 
 const PLUGIN_KEY = 'PrefillCompatFix';
+const PLUGIN_DISPLAY_NAME = '预填充兼容修复';
 const ENABLED = true;                  /* 总开关：当前版本默认启用 */
 const DEBUG_LOGS = false;              /* 是否输出详细调试日志 */
 const PLACEHOLDER_TEXT = ' ';          /* 追加消息内容：必须是非空字符串 */
 const APP_READY_FALLBACK_MS = 1200;    /* APP_READY 已错过时的单次兜底安装延时(ms) */
 const JSON_BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
 
-/* 默认保护名单：实际模型名包含任一配置项即命中；不区分大小写 */
+/* 默认保护名单：实际模型名包含任一配置项即命中，不区分大小写。
+   设置弹窗会在内置名单基础上合并自定义与删除记录，得到最终生效清单 */
 const MODEL_PATTERNS = [
     /* Google Gemini */
     'gemini-3.5-flash-lite',
@@ -52,29 +55,465 @@ const MODEL_PATTERNS = [
     'claude-fable-5-1',
 ];
 
+/* ── 模型清单设置 ─────────────────────── */
+
+const MODEL_LIST_INPUT_ID = 'pcf-model-list-input';
+const MODEL_LIST_MAX_LINES = 100;      /* 清单行数上限，防止整段粘贴灌爆设置文件 */
+const MODEL_LIST_LINK_ID = 'pcf-model-list-link';
+const MODEL_LIST_LINK_PUSH_ID = 'pcf-model-list-push';
+/* 不可见字符：控制字符 + 常见零宽/双向格式字符；空白类字符另行归一为半角空格 */
+const INVISIBLE_CHAR_RE = /[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u00AD\u034F\u061C\u17B4-\u17B5\u180B-\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\uFFF9-\uFFFB]/g;
+/* 需要当成空格处理的空白（换行与全角空格在切分前/后单独处理） */
+const SPACE_LIKE_RE = /[\t\f\v\u00A0\u1680\u2000-\u200A\u202F\u205F]/g;
+
+/* 从 ST 设置中读取自定义与删除记录；结构异常时按空处理 */
+function getModelListStored() {
+    const context = getStContext();
+    if (!context || !context.extensionSettings) {
+        return { custom: [], removed: [] };
+    }
+
+    const stored = context.extensionSettings[PLUGIN_KEY];
+    if (!isPlainObject(stored)) {
+        return { custom: [], removed: [] };
+    }
+
+    const pick = (value) => Array.isArray(value)
+        ? value.filter((x) => typeof x === 'string' && x.trim() !== '')
+        : [];
+
+    return { custom: pick(stored.custom), removed: pick(stored.removed) };
+}
+
+/* 生效清单 = 内置清单 − 删除记录 + 自定义；按型号串不区分大小写去重 */
+function getEffectiveModelPatterns() {
+    const { custom, removed } = getModelListStored();
+    const removedKeys = new Set(removed.map(normalizeModelName).filter((x) => x !== ''));
+    const seen = new Set();
+    const result = [];
+
+    for (const pattern of MODEL_PATTERNS) {
+        const key = normalizeModelName(pattern);
+        if (key === '' || seen.has(key) || removedKeys.has(key)) continue;
+        seen.add(key);
+        result.push(pattern);
+    }
+
+    for (const pattern of custom) {
+        const key = normalizeModelName(pattern);
+        if (key === '' || seen.has(key)) continue;
+        seen.add(key);
+        result.push(pattern);
+    }
+
+    return result;
+}
+
+/* 生成设置弹窗使用的文本：把当前生效清单按一行一条展示 */
+function getModelListText() {
+    return getEffectiveModelPatterns().join('\n');
+}
+
+/* 把清洗结果写回 ST 设置；custom = 非内置条目，removed = 被删掉的内置条目 */
+function saveModelListSettings(lines) {
+    const builtinKeys = new Set(MODEL_PATTERNS.map(normalizeModelName));
+    const custom = [];
+    const removed = [];
+
+    for (const line of lines) {
+        const key = normalizeModelName(line);
+        if (key === '') continue;
+        if (builtinKeys.has(key)) continue;
+        custom.push(line);
+    }
+
+    for (const pattern of MODEL_PATTERNS) {
+        const key = normalizeModelName(pattern);
+        if (!key) continue;
+        if (lines.some((line) => normalizeModelName(line) === key)) continue;
+        removed.push(pattern);
+    }
+
+    const context = getStContext();
+    if (!context || !context.extensionSettings) {
+        return false;
+    }
+
+    context.extensionSettings[PLUGIN_KEY] = { custom, removed };
+    if (typeof context.saveSettingsDebounced === 'function') {
+        context.saveSettingsDebounced();
+    }
+    return true;
+}
+
+/* 清洗用户输入：返回 { lines, fixes, issues }；issues 非空时需用户确认 */
+function normalizeModelListInput(text) {
+    const raw = typeof text === 'string' ? text : '';
+    /* 换行统一为 \n；其他 Unicode 空白在逐行清洗时转为半角空格 */
+    const normalized = raw
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\u0085\u2028\u2029]/g, '\n');
+    const rawLines = normalized.split('\n');
+
+    /* 按实际发生的清洗动作分类统计；同一行可计入多个类别（N 表示涉及条目数） */
+    let blankLines = 0;
+    let trimLines = 0;
+    let collapseLines = 0;
+    let invisibleLines = 0;
+    let fullWidthSpaceLines = 0;
+    const lines = [];
+
+    for (const rawLine of rawLines) {
+        const hadFullWidthSpace = rawLine.includes('\u3000');
+        if (hadFullWidthSpace) fullWidthSpaceLines += 1;
+        const normalizedLine = rawLine.replace(/\u3000/g, ' ').replace(SPACE_LIKE_RE, ' ');
+        const stripped = normalizedLine.replace(INVISIBLE_CHAR_RE, '');
+        const hadInvisible = stripped !== normalizedLine;
+        if (hadInvisible) invisibleLines += 1;
+
+        const line = stripped.trim().replace(/ {2,}/g, ' ');
+        if (line === '') {
+            blankLines += 1;
+            continue;
+        }
+        if (stripped !== stripped.trim()) trimLines += 1;
+        if (/ {2,}/.test(stripped.trim())) collapseLines += 1;
+        lines.push(line);
+    }
+
+    const result = [];
+    const seen = new Set();
+    const issues = [];
+    const fixes = [];
+    let duplicates = 0;
+    let separators = 0;
+    let specialChars = 0;
+
+    for (const line of lines) {
+        if (/[,;:，；：、]/.test(line)) separators += 1;
+        if (/[^\u0000-\u007F]/.test(line)) specialChars += 1;
+
+        const key = line.toLowerCase();
+        if (seen.has(key)) {
+            duplicates += 1;
+            continue;
+        }
+        seen.add(key);
+        result.push(line);
+    }
+
+    if (fullWidthSpaceLines > 0) fixes.push(`全角空格转为半角（${fullWidthSpaceLines}）`);
+    if (invisibleLines > 0) fixes.push(`清除不可见字符（${invisibleLines}）`);
+    if (blankLines > 0) fixes.push(`移除空行（${blankLines}）`);
+    if (trimLines > 0) fixes.push(`移除首尾空格（${trimLines}）`);
+    if (collapseLines > 0) fixes.push(`合并行内连续空格（${collapseLines}）`);
+    if (duplicates > 0) fixes.push(`移除重复项（${duplicates}）`);
+    if (specialChars > 0) issues.push(`存在全角字符或其他特殊字符（${specialChars}）`);
+
+    /* 首尾空格已清除，清洗后仍含空格的条目才算内部空格 */
+    const spaced = result.filter((line) => /\s/.test(line)).length;
+    if (spaced > 0) issues.push(`包含行内空格，可能无法正确匹配（${spaced}）`);
+    if (separators > 0) issues.push(`存在逗号/分号等分隔符，请确认模型名是否需要拆分（${separators}）`);
+
+    return { lines: result, fixes, issues, tooMany: result.length > MODEL_LIST_MAX_LINES };
+}
+
+/* 让弹窗列表及其项目文字左对齐，避免 ST 默认居中时圆点与文字错位。
+   只处理列表本身，标题和说明文字仍保持弹窗默认对齐 */
+function applyPopupListAlign(list) {
+    list.style.textAlign = 'left';
+    list.querySelectorAll('li').forEach((li) => {
+        li.style.textAlign = 'left';
+    });
+}
+
+/* 往弹窗正文追加一组列表项；只对齐列表本身，说明文字仍保持弹窗默认居中 */
+function appendPopupList(parent, items) {
+    const list = document.createElement('ul');
+    for (const item of items) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        list.appendChild(li);
+    }
+    parent.appendChild(list);
+    applyPopupListAlign(list);
+}
+
+/* 构造弹窗正文：标题、说明与可调整高度的清单输入框 */
+function buildModelListDialogContent(initialText) {
+    const content = document.createElement('div');
+    content.className = 'flex-container flexFlowColumn height100p';
+
+    const title = document.createElement('h3');
+    title.className = 'margin0 flex-container flexFlowColumn textAlignCenter';
+    title.textContent = PLUGIN_DISPLAY_NAME;
+
+    const area = document.createElement('div');
+    area.className = 'flex1 flex-container flexFlowColumn';
+
+    const hint = document.createElement('h4');
+    hint.className = 'margin0';
+    hint.textContent = '生效模型清单（每行一个，保存生效，无需刷新）';
+
+    const textarea = document.createElement('textarea');
+    textarea.id = MODEL_LIST_INPUT_ID;
+    textarea.className = 'text_pole';
+    textarea.placeholder = '示例：\ngemini-3.7-flash\ngemini-3.8-flash\ngemini-4-argon';
+    textarea.spellcheck = false;
+    textarea.value = initialText;
+    /* 保留较高的默认高度和下方空间，并允许用户拖拽调整 */
+    textarea.style.height = '60vh';
+    textarea.style.minHeight = '8em';
+    textarea.style.maxHeight = '75vh';
+
+    area.appendChild(hint);
+    area.appendChild(textarea);
+    content.appendChild(title);
+    content.appendChild(area);
+    return { content, textarea };
+}
+
+/* 校验清单，并在超限、空清单或存在问题等情况下提示用户；返回是否允许保存 */
+async function confirmModelListIssues(text) {
+    const context = getStContext();
+    if (!context) return false;
+
+    const info = normalizeModelListInput(text);
+
+    /* 超过行数上限：直接拒绝保存 */
+    if (info.tooMany) {
+        await context.callGenericPopup(
+            '行数超出上限，请删减后重试。',
+            context.POPUP_TYPE.CONFIRM,
+            '',
+            { okButton: '确定', cancelButton: false },
+        );
+        return false;
+    }
+
+    /* 空清单等同于关闭全部模型保护，保存前单独确认 */
+    if (info.lines.length === 0) {
+        const emptyNotice = document.createElement('div');
+        emptyNotice.append('模型清单为空，将');
+        const emptyStrong = document.createElement('strong');
+        emptyStrong.textContent = '不再对任何模型进行自动修复';
+        emptyNotice.append(emptyStrong);
+        emptyNotice.append('。确定保存吗？');
+        const confirmed = await context.callGenericPopup(
+            emptyNotice,
+            context.POPUP_TYPE.CONFIRM,
+            '',
+            { okButton: '确定', cancelButton: '取消' },
+        );
+        return confirmed === context.POPUP_RESULT.AFFIRMATIVE;
+    }
+
+    const hasFixes = info.fixes.length > 0;
+    const hasIssues = info.issues.length > 0;
+
+    /* 同时存在自动修正与待确认问题时，合并为一次确认 */
+    if (hasFixes && hasIssues) {
+        const wrap = document.createElement('div');
+        const fixTitle = document.createElement('h4');
+        fixTitle.className = 'margin0';
+        fixTitle.textContent = '已自动修正格式：';
+        wrap.appendChild(fixTitle);
+        appendPopupList(wrap, info.fixes);
+
+        /* 间隔块避免列表下边距折叠，使两个提示区域保持分开 */
+        const sectionGap = document.createElement('div');
+        sectionGap.dataset.pcfSectionGap = '';
+        sectionGap.style.height = '0.75em';
+        wrap.appendChild(sectionGap);
+
+        const issueTitle = document.createElement('h4');
+        issueTitle.className = 'margin0';
+        issueTitle.textContent = '修正后仍检测到以下问题，请确认是否保存：';
+        wrap.appendChild(issueTitle);
+        appendPopupList(wrap, info.issues);
+
+        const confirmed = await context.callGenericPopup(
+            wrap,
+            context.POPUP_TYPE.CONFIRM,
+            '',
+            { okButton: '确定', cancelButton: '取消' },
+        );
+        return confirmed === context.POPUP_RESULT.AFFIRMATIVE;
+    }
+
+    /* 只有自动修正时展示信息框，无需再次确认 */
+    if (hasFixes) {
+        const fixedWrap = document.createElement('div');
+        const fixedTitle = document.createElement('h4');
+        fixedTitle.className = 'margin0';
+        fixedTitle.textContent = '已自动修正格式并保存：';
+        fixedWrap.appendChild(fixedTitle);
+        appendPopupList(fixedWrap, info.fixes);
+        await context.callGenericPopup(fixedWrap, context.POPUP_TYPE.CONFIRM, '', { okButton: '确定', cancelButton: false });
+        return true;
+    }
+
+    /* 无待确认内容时直接允许保存 */
+    if (!hasIssues) {
+        return true;
+    }
+
+    /* 使用 DOM 节点展示动态文本，避免模型名被当成 HTML */
+    const wrap = document.createElement('div');
+    const ask = document.createElement('h4');
+    ask.className = 'margin0';
+    ask.textContent = '检测到以下问题，请确认是否保存：';
+    wrap.appendChild(ask);
+    appendPopupList(wrap, info.issues);
+
+    const confirmed = await context.callGenericPopup(
+        wrap,
+        context.POPUP_TYPE.CONFIRM,
+        '',
+        { okButton: '确定', cancelButton: '取消' },
+    );
+    return confirmed === context.POPUP_RESULT.AFFIRMATIVE;
+}
+
+/* 打开设置弹窗，并处理保存、取消与恢复默认 */
+async function openModelListDialog() {
+    const context = getStContext();
+    if (!context || typeof context.callGenericPopup !== 'function' || !context.POPUP_TYPE) {
+        logWarn('无法打开模型清单设置：ST 弹窗组件不可用');
+        return;
+    }
+
+    const PopupClass = context.Popup
+        || (window.SillyTavern && window.SillyTavern.libs && window.SillyTavern.libs.Popup);
+    if (typeof PopupClass !== 'function') {
+        logWarn('无法打开模型清单设置：ST Popup 类不可用');
+        return;
+    }
+
+    const popupType = context.POPUP_TYPE;
+    const resultTypes = context.POPUP_RESULT;
+    /* 已保存内容；取消或校验失败后恢复为它 */
+    let savedText = getModelListText();
+    let initialText = savedText;
+
+    while (true) {
+        const parts = buildModelListDialogContent(initialText);
+        /* null：正常关闭；restore：恢复默认；cancel：取消或拒绝确认 */
+        let closingWithResult = null;
+        /* 是否正在等待保存校验 */
+        let savePending = false;
+
+        const popup = new PopupClass(parts.content, popupType.TEXT, '', {
+            wide: true,
+            large: true,
+            allowVerticalScrolling: true,
+            okButton: false,
+            cancelButton: false,
+            customButtons: [
+                { text: '保存', classes: ['popup-button-ok'], action: () => { savePending = true; popup.completeAffirmative(); } },
+                { text: '取消', classes: ['popup-button-cancel'], result: resultTypes.NEGATIVE, appendAtEnd: true },
+                { text: '恢复默认', action: () => { void handleRestore(); }, appendAtEnd: true },
+            ],
+            onClosing: async (instance) => {
+                /* 保存前校验；不通过时保持弹窗并保留输入 */
+                if (savePending) {
+                    const ok = await confirmModelListIssues(parts.textarea.value);
+                    if (!ok) {
+                        savePending = false;
+                        return false;
+                    }
+                    closingWithResult = resultTypes.AFFIRMATIVE;
+                }
+                return true;
+            },
+        });
+
+        const handleRestore = async () => {
+            const ctx = getStContext() || context;
+            const confirmed = await ctx.callGenericPopup(
+                '将清空自定义条目，并恢复内置清单。确定恢复吗？',
+                popupType.CONFIRM,
+                '',
+                { okButton: '确定', cancelButton: '取消' },
+            );
+            if (confirmed !== resultTypes.AFFIRMATIVE) return;
+            closingWithResult = 'restore';
+            await popup.completeCancelled();
+        };
+
+        await popup.show();
+
+        if (closingWithResult === 'restore') {
+            /* 恢复默认后重新打开弹窗，等待用户确认保存 */
+            initialText = MODEL_PATTERNS.join('\n');
+            continue;
+        }
+
+        if (closingWithResult === resultTypes.AFFIRMATIVE) {
+            const info = normalizeModelListInput(parts.textarea.value);
+            const saved = saveModelListSettings(info.lines);
+            if (!saved) {
+                logWarn('保存模型清单失败：ST 设置接口不可用');
+            }
+            savedText = info.lines.join('\n');
+            return;
+        }
+
+        return;
+    }
+}
+
+/* 在 API 面板「查看密钥」右侧注入设置入口。
+   仅插入本插件元素，并用 0 宽撑杆维持该行原有的两端布局 */
+function installModelListLink() {
+    const existing = document.getElementById(MODEL_LIST_LINK_ID);
+    if (existing && document.body.contains(existing)) return true;
+
+    const viewSecrets = document.getElementById('viewSecrets');
+    if (!viewSecrets || !viewSecrets.parentElement) return false;
+
+    const link = document.createElement('a');
+    link.id = MODEL_LIST_LINK_ID;
+    link.href = 'javascript:void(0);';
+    link.textContent = PLUGIN_DISPLAY_NAME;
+    link.addEventListener('click', () => {
+        openModelListDialog();
+    });
+
+    /* 撑杆用自动外边距继续把「查看密钥」顶在右侧 */
+    if (!document.getElementById(MODEL_LIST_LINK_PUSH_ID)) {
+        const push = document.createElement('span');
+        push.id = MODEL_LIST_LINK_PUSH_ID;
+        push.style.marginLeft = 'auto';
+        viewSecrets.parentElement.insertBefore(push, viewSecrets);
+    }
+
+    viewSecrets.parentElement.insertBefore(link, viewSecrets.nextSibling);
+    return true;
+}
+
 /* ── 状态变量 ─────────────────────────── */
 
-/* WeakMap<Window, Function>: 已安装包装的窗口 → 包装函数 */
+/* 窗口 → 已安装的 fetch 包装 */
 const hookedFetchHooks = new WeakMap();
-/* WeakMap<XMLHttpRequest, {method, url}>: XHR 实例的 open 参数（send 时读取；重复 open 覆盖） */
+/* XHR 实例 → open 参数（send 时读取，重复 open 会覆盖） */
 const xhrOpenMeta = new WeakMap();
-/* WeakMap<Window, {open, send}>: 已安装 XHR 包装的 realm（主窗口 + 同源 iframe）→ 安装时的原型方法，
-   用途与 hookedFetchHooks 相同：防同一 realm 重复包装；iframe 重载或原型被替换后重新包装 */
+/* realm → 安装时的 XHR 原型方法，用于检测重复安装或原型被替换 */
 const hookedXhrProtos = new WeakMap();
-/* WeakSet<Window>: 已经计入统计的窗口，避免同一窗口重复计数 */
+/* 已经计入统计的窗口 */
 const hookedWindows = new WeakSet();
-/* WeakSet<HTMLIFrameElement>: 已挂 load 监听的 iframe，避免重复绑定 */
+/* 已经绑定 load 监听的 iframe */
 const iframeLoadListenersAttached = new WeakSet();
 
-/* boolean: 主窗口 hook（fetch + XHR）是否已安装 */
+/* 主窗口 hook（fetch + XHR）是否已安装 */
 let mainHookInstalled = false;
-/* boolean: iframe hook（fetch + XHR）扫描器是否已安装 */
+/* iframe hook（fetch + XHR）扫描器是否已安装 */
 let iframeHooksInstalled = false;
-/* number: 已安装 hook 的 iframe 窗口数量（用于调试） */
+/* 已安装 hook 的 iframe 窗口数量（用于调试） */
 let iframeHookCount = 0;
-/* object|null: 最近一次请求的简要判断结果 */
+/* 最近一次请求的简要判断结果 */
 let lastDecision = null;
-/* boolean: 启动成功提示是否已输出过 */
+/* 启动成功提示是否已输出过 */
 let startupLogged = false;
 
 /* ── 日志工具 ─────────────────────────── */
@@ -122,7 +561,7 @@ function logError(message, error) {
 
 /* ── 基础工具 ─────────────────────────── */
 
-/* 判断是否为普通对象（排除数组与 null） */
+/* 判断是否为普通对象（不含数组与 null） */
 function isPlainObject(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value);
 }
@@ -157,7 +596,6 @@ function getRequestUrlObject(requestUrl) {
     }
 }
 
-/* 获取 URL 的 pathname；失败时返回空字符串 */
 function getRequestPathname(requestUrl) {
     const urlObject = getRequestUrlObject(requestUrl);
     return urlObject ? urlObject.pathname.toLowerCase() : '';
@@ -173,7 +611,6 @@ function getHeaderValue(headers, name) {
     }
 }
 
-/* 获取本次 fetch 实际生效的 method */
 function getEffectiveMethod(input, init) {
     if (init && typeof init.method === 'string' && init.method) {
         return init.method.toUpperCase();
@@ -184,7 +621,6 @@ function getEffectiveMethod(input, init) {
     return 'GET';
 }
 
-/* 获取本次 fetch 实际生效的 Content-Type */
 function getEffectiveContentType(input, init) {
     if (init && init.headers !== undefined && init.headers !== null) {
         return getHeaderValue(init.headers, 'content-type');
@@ -202,7 +638,6 @@ function isJsonContentType(contentType) {
     return lower.includes('application/json') || lower.includes('+json');
 }
 
-/* 安全解码 URL 片段 */
 function safeDecodeURIComponent(value) {
     if (typeof value !== 'string') return '';
     try {
@@ -212,12 +647,10 @@ function safeDecodeURIComponent(value) {
     }
 }
 
-/* 规范化模型名 */
 function normalizeModelName(value) {
     return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
-/* 规范化消息角色 */
 function normalizeRole(value) {
     return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
@@ -227,7 +660,7 @@ function findMatchedModelPattern(modelName) {
     const normalizedModel = normalizeModelName(modelName);
     if (!normalizedModel) return '';
 
-    for (const pattern of MODEL_PATTERNS) {
+    for (const pattern of getEffectiveModelPatterns()) {
         const normalizedPattern = normalizeModelName(pattern);
         if (!normalizedPattern) continue;
         if (normalizedModel.includes(normalizedPattern)) return normalizedPattern;
@@ -686,7 +1119,7 @@ function createFetchHook(realmWindow, getOriginalFetch) {
 
 /* ── XHR 请求拦截 ─────────────────────── */
 
-/* 把 open 收到的地址按该 realm 自身的 location 解析为绝对地址（主窗口与 iframe 的 location 不同） */
+/* 按 realm 自身的地址把 XHR URL 解析为绝对地址 */
 function resolveRealmUrl(realmWindow, url) {
     const raw = (typeof url === 'string') ? url : (url != null ? String(url) : '');
     if (!raw) return '';
@@ -698,9 +1131,8 @@ function resolveRealmUrl(realmWindow, url) {
     }
 }
 
-/* 同步判定一次 XHR 请求体是否需要补全（send 是同步的，不能走 async 的 fetch 流程）。
-   判据与 fetch 相同、不是「能解析成 JSON」就改：写方法 + 目标 URL + 请求体结构 + 模型命中名单；
-   任何一步不满足都返回 changed:false，保持原请求不变。 */
+/* 同步构造 XHR 请求体的修改方案；发送方法是同步的，不能复用异步 fetch 流程。
+   判断条件与 fetch 一致，无法安全修改时返回 changed:false */
 function planXhrBodyModification(requestUrl, method, bodyText) {
     if (!JSON_BODY_METHODS.has(method)) {
         return {
@@ -748,10 +1180,8 @@ function planXhrBodyModification(requestUrl, method, bodyText) {
     };
 }
 
-/* 给单个 realm 安装 XHR 包装（主窗口与同源 iframe 共用）：open 记录方法与地址（相对地址按该 realm
-   自身 location 解析为绝对）；send 里同步判定，需要补全时用改后的文本调用原 send，否则保持原参数。
-   同一 realm 只装一次：已装且原型方法未被替换就跳过；iframe 重载或内部脚本替换原型后重新包装。
-   保护逻辑自身异常时按原请求发送；原 send 自身抛错时保持原异常、不重发。 */
+/* 给单个 realm 安装 XHR 包装：open 记录请求信息，send 同步判断并按需替换 body。
+   同一 realm 只安装一次；原型被替换后允许重新包装，保护逻辑异常时放行原请求 */
 function installRealmXhrHook(realmWindow) {
     if (!realmWindow) return false;
 
@@ -785,7 +1215,7 @@ function installRealmXhrHook(realmWindow) {
     const hookedSend = function hookedXhrSend(body) {
         if (!ENABLED) return originalSend.apply(this, arguments);
 
-        /* string|null: 需要补全时替换后的请求文本；保持 null 表示按原参数发送 */
+        /* 需要修改时的请求文本；null 表示按原参数发送 */
         let modifiedBodyText = null;
         let meta = null;
         try {
@@ -809,7 +1239,7 @@ function installRealmXhrHook(realmWindow) {
         }
 
         if (modifiedBodyText === null) return originalSend.apply(this, arguments);
-        /* 用改后文本发送；原 send 自身抛错时保持原异常行为，不重发 */
+        /* 使用修改后的文本发送；原 send 抛错时保持原异常，不重发 */
         return originalSend.call(this, modifiedBodyText);
     };
 
@@ -945,6 +1375,17 @@ function installIframeRequestHooks() {
 window.__PrefillCompatFix = {
     inspect: inspectRequestBody,
     getLastDecision: () => lastDecision,
+    getModelList: () => ({
+        effective: getEffectiveModelPatterns(),
+        builtin: MODEL_PATTERNS.slice(),
+        stored: getModelListStored(),
+    }),
+    /* 测试用：把「一行一条」的文本按正式流程清洗并写入设置 */
+    applyModelListText: (text) => {
+        const info = normalizeModelListInput(text);
+        const saved = saveModelListSettings(info.lines);
+        return { lines: info.lines, fixes: info.fixes, issues: info.issues, saved };
+    },
     getHookCount: () => ({
         main: mainHookInstalled ? 1 : 0,
         iframes: iframeHookCount,
@@ -971,7 +1412,29 @@ function getStContext() {
 function installAllHooks() {
     installMainRequestHooks();
     installIframeRequestHooks();
+    installModelListLinkWithRetry();
     logStartupOnce();
+}
+
+/* 注入设置链接：ST 界面或插件加载顺序可能稍晚，带重试 + 兜底观察 */
+function installModelListLinkWithRetry() {
+    if (installModelListLink()) return;
+
+    let attempts = 0;
+    const timer = setInterval(() => {
+        attempts += 1;
+        if (installModelListLink() || attempts >= 20) {
+            clearInterval(timer);
+        }
+    }, 500);
+
+    /* 仍未注入时，用观察器等目标行出现（例如自定义主题或后续 DOM 变动） */
+    const observer = new MutationObserver(() => {
+        if (installModelListLink()) {
+            observer.disconnect();
+        }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
 }
 
 /* 等待 ST 就绪（APP_READY）后安装，尽量排在其它扩展之后；已错过时用兜底延时安装 */
