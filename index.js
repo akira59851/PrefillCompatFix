@@ -4,13 +4,13 @@
 
 /* 【区块索引】（按文件从上到下的顺序）
    1. 可调参数与常量     模型名单、占位内容、安装时机
-   2. 模型清单设置       用户自定义清单的存储、合并、弹窗与入口注入
+   2. 模型清单设置       用户清单、设置弹窗、更新提示、入口注入与清理
    3. 状态变量           挂钩状态与最近一次判断结果
    4. 日志工具           统一日志前缀与级别
    5. 基础工具           请求对象、URL、Header、模型名等纯函数
    6. 模型名提取         按明确优先级收集候选并返回最终来源
    7. 消息数组选择       在 messages / contents 之间做单目标选择
-   8. 请求体分析与修改   纯判断、追加 user、构造 modified init
+   8. 请求体分析与修改   正文描述、统一修改计划、追加 user
    9. Fetch 请求拦截     主窗口与同源 iframe 共用包装逻辑
    10. XHR 请求拦截       open/send 包装与同步补全判定
    11. Hook 安装         主窗口、同源 iframe、动态 iframe（fetch + XHR）
@@ -22,14 +22,15 @@
 
 const PLUGIN_KEY = 'PrefillCompatFix';
 const PLUGIN_DISPLAY_NAME = '预填充兼容修复';
-const ENABLED = true;                  /* 总开关：当前版本默认启用 */
+const BUILTIN_UPDATE_TOAST_TITLE = `${PLUGIN_DISPLAY_NAME}・内置清单更新`;
+const ENABLED = true;                  /* 内部安全开关：当前版本固定启用，不提供用户总开关 */
 const DEBUG_LOGS = false;              /* 是否输出详细调试日志 */
-const PLACEHOLDER_TEXT = ' ';          /* 追加消息内容：必须是非空字符串 */
+const DEFAULT_PLACEHOLDER_TEXT = '\u200B'; /* 默认追加消息内容 */
 const APP_READY_FALLBACK_MS = 1200;    /* APP_READY 已错过时的单次兜底安装延时(ms) */
 const JSON_BODY_METHODS = new Set(['POST', 'PUT', 'PATCH']);
 
 /* 默认保护名单：实际模型名包含任一配置项即命中，不区分大小写。
-   设置弹窗会在内置名单基础上合并自定义与删除记录，得到最终生效清单 */
+   设置弹窗会在内置清单基础上合并自定义与手动移除记录，得到最终生效清单 */
 const MODEL_PATTERNS = [
     /* Google Gemini */
     'gemini-3.5-flash-lite',
@@ -37,6 +38,8 @@ const MODEL_PATTERNS = [
     'gemini-3.7-flash',
     'gemini-3.8-flash',
     'gemini-4-argon',
+    'gemini-4-carbon',
+    'gemini-4-hydrogen',
 
     /* Anthropic Claude：4.6 及后续型号 */
     'claude-opus-4-6',
@@ -53,6 +56,7 @@ const MODEL_PATTERNS = [
 
     'claude-fable-5',
     'claude-fable-5-1',
+    'claude-fable-5-2',
 ];
 
 /* ── 模型清单设置 ─────────────────────── */
@@ -61,12 +65,46 @@ const MODEL_LIST_INPUT_ID = 'pcf-model-list-input';
 const MODEL_LIST_MAX_LINES = 100;      /* 清单行数上限，防止整段粘贴灌爆设置文件 */
 const MODEL_LIST_LINK_ID = 'pcf-model-list-link';
 const MODEL_LIST_LINK_PUSH_ID = 'pcf-model-list-push';
+const HELP_BUTTON_ID = 'pcf-help-button';
+const CUSTOM_CONTENT_TOGGLE_ID = 'pcf-custom-content-toggle';
+const CUSTOM_CONTENT_INPUT_ID = 'pcf-custom-content-input';
+const BUILTIN_UPDATE_PREVIEW_LIMIT = 5; /* 更新提示中单组型号最多展示数量 */
 /* 不可见字符：控制字符 + 常见零宽/双向格式字符；空白类字符另行归一为半角空格 */
 const INVISIBLE_CHAR_RE = /[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u00AD\u034F\u061C\u17B4-\u17B5\u180B-\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\uFFF9-\uFFFB]/g;
 /* 需要当成空格处理的空白（换行与全角空格在切分前/后单独处理） */
 const SPACE_LIKE_RE = /[\t\f\v\u00A0\u1680\u2000-\u200A\u202F\u205F]/g;
+/* 本次页面加载是否已检查并处理内置清单更新 */
+let builtinUpdateChecked = false;
+/* 使用说明弹窗是否已打开，避免连续点击叠加多个说明页 */
+let usageHelpOpen = false;
+/* 使用说明：可直接调整小标题、正文和列表内容 */
+const USAGE_HELP_SECTIONS = [
+    {
+        heading: '工作原理',
+        paragraphs: [
+            '修复部分模型因不支持预填充（请求以非 user 角色结尾）导致的「error 400: Requests ending with a model turn are not supported」报错。',
+            '当请求的模型命中生效清单，且末条消息不为 user 时，插件会在末尾静默追加一条用户消息（默认为零宽空格），使请求正常发送。',
+        ],
+    },
+    {
+        heading: '设置说明',
+        items: [
+            '生效模型清单：每行填写一个接口实际的「模型 ID」，保存即生效。采用不区分大小写的包含匹配，请勿填写过短的通用词（如 gemini），以免误伤正常模型。',
+            '名单更新同步：插件更新内置名单时会自动同步并提醒；手动删除过的内置型号不会自动恢复。',
+            '自定义补充消息：仅建议在默认的零宽空格被其他插件或上游过滤时勾选（可尝试填写「继续」、「Continue」或标点符号）。自定义内容会实际发送给模型，可能轻微影响回复。',
+        ],
+    },
+    {
+        heading: '注意事项与排查',
+        items: [
+            '适用范围：仅解决「末尾角色非 user（预填充）」引发的 400 报错，不涵盖上下文超限、参数错误、空消息等其他原因导致的 400 错误。',
+            '兼容性：支持 ST 原生及常见第三方插件请求，未覆盖采用特殊加密、后端代理打包或跨域隔离的请求链路。',
+            '未生效排查：若启用后仍报相同错误，请依次检查：① 模型 ID 是否拼写准确；② 尝试开启「自定义补充消息」绕过空消息过滤。',
+        ],
+    },
+];
 
-/* 从 ST 设置中读取自定义与删除记录；结构异常时按空处理 */
+/* 从 ST 设置中读取自定义与手动移除记录；结构异常时按空处理 */
 function getModelListStored() {
     const context = getStContext();
     if (!context || !context.extensionSettings) {
@@ -83,6 +121,34 @@ function getModelListStored() {
         : [];
 
     return { custom: pick(stored.custom), removed: pick(stored.removed) };
+}
+
+/* 读取自定义补充消息设置；结构异常或读取失败时返回空状态 */
+function getCustomContentStored() {
+    try {
+        const context = getStContext();
+        const stored = context && context.extensionSettings
+            ? context.extensionSettings[PLUGIN_KEY]
+            : null;
+        if (!isPlainObject(stored)) {
+            return { enabled: false, content: '' };
+        }
+        return {
+            enabled: stored.customContentEnabled === true,
+            content: typeof stored.customContent === 'string' ? stored.customContent : '',
+        };
+    } catch (error) {
+        logWarn('读取自定义补充消息内容失败，使用默认值', error);
+        return { enabled: false, content: '' };
+    }
+}
+
+/* 计算本次追加内容：自定义非空且已启用时原样使用，否则回退默认值 */
+function getEffectivePlaceholderText() {
+    const custom = getCustomContentStored();
+    return custom.enabled && custom.content.length > 0
+        ? custom.content
+        : DEFAULT_PLACEHOLDER_TEXT;
 }
 
 /* 生效清单 = 内置清单 − 删除记录 + 自定义；按型号串不区分大小写去重 */
@@ -114,8 +180,8 @@ function getModelListText() {
     return getEffectiveModelPatterns().join('\n');
 }
 
-/* 把清洗结果写回 ST 设置；custom = 非内置条目，removed = 被删掉的内置条目 */
-function saveModelListSettings(lines) {
+/* 保存模型清单；传入自定义补充消息参数时同时保存，未传入则保留原值 */
+function saveModelListSettings(lines, customContentEnabled, customContent) {
     const builtinKeys = new Set(MODEL_PATTERNS.map(normalizeModelName));
     const custom = [];
     const removed = [];
@@ -139,12 +205,177 @@ function saveModelListSettings(lines) {
         return false;
     }
 
-    context.extensionSettings[PLUGIN_KEY] = { custom, removed };
+    const stored = context.extensionSettings[PLUGIN_KEY];
+    /* 合并写入，避免清除内置清单快照等元数据 */
+    const next = {
+        ...(isPlainObject(stored) ? stored : {}),
+        custom,
+        removed,
+    };
+    if (typeof customContentEnabled === 'boolean') {
+        next.customContentEnabled = customContentEnabled;
+    }
+    if (typeof customContent === 'string') {
+        next.customContent = customContent;
+    }
+    context.extensionSettings[PLUGIN_KEY] = next;
     if (typeof context.saveSettingsDebounced === 'function') {
         context.saveSettingsDebounced();
     }
     return true;
 }
+
+/* 读取上次记录的内置清单快照；从未记录过时返回 null */
+function getBuiltinSnapshot(context) {
+    const stored = context && context.extensionSettings
+        ? context.extensionSettings[PLUGIN_KEY]
+        : null;
+    if (!isPlainObject(stored) || !Array.isArray(stored.builtinSnapshot)) {
+        return null;
+    }
+
+    return stored.builtinSnapshot.filter((x) => typeof x === 'string' && x.trim() !== '');
+}
+
+/* 保存当前内置清单快照，并保留用户自定义与删除记录 */
+function saveBuiltinSnapshot(context) {
+    const stored = context.extensionSettings[PLUGIN_KEY];
+    context.extensionSettings[PLUGIN_KEY] = {
+        ...(isPlainObject(stored) ? stored : {}),
+        builtinSnapshot: MODEL_PATTERNS.slice(),
+    };
+    if (typeof context.saveSettingsDebounced === 'function') {
+        context.saveSettingsDebounced();
+    }
+}
+
+/* 按型号集合计算内置清单差异；顺序或大小写变化不算变化 */
+function getBuiltinListDiff(previous, current) {
+    const beforeKeys = new Set(previous.map(normalizeModelName).filter((x) => x !== ''));
+    const afterKeys = new Set(current.map(normalizeModelName).filter((x) => x !== ''));
+
+    return {
+        added: current.filter((x) => {
+            const key = normalizeModelName(x);
+            return key !== '' && !beforeKeys.has(key);
+        }),
+        removed: previous.filter((x) => {
+            const key = normalizeModelName(x);
+            return key !== '' && !afterKeys.has(key);
+        }),
+    };
+}
+
+/* 截取提示中的型号列表：最多展示 5 个，超出时直接追加三个点 */
+function formatNoticePatternList(patterns, decorate = (x) => x) {
+    const shown = patterns
+        .slice(0, BUILTIN_UPDATE_PREVIEW_LIMIT)
+        .map((x) => decorate(x));
+    return `${shown.join('、')}${patterns.length > BUILTIN_UPDATE_PREVIEW_LIMIT ? '...' : ''}`;
+}
+
+/* 生成两段式更新提示：新增在上、移除在下；用户状态说明跟随对应段落 */
+function formatBuiltinListUpdateMessage(previous, current, custom, userRemoved) {
+    const { added, removed } = getBuiltinListDiff(previous, current);
+    if (added.length === 0 && removed.length === 0) return '';
+
+    const customKeys = new Set(custom.map(normalizeModelName).filter((x) => x !== ''));
+    const removedKeys = new Set(userRemoved.map(normalizeModelName).filter((x) => x !== ''));
+    const addedCustom = added.filter((x) => customKeys.has(normalizeModelName(x)));
+    const addedManuallyRemoved = added.filter((x) => {
+        const key = normalizeModelName(x);
+        return removedKeys.has(key) && !customKeys.has(key);
+    });
+    const removedManuallyAdded = removed.filter((x) => customKeys.has(normalizeModelName(x)));
+    const removedManuallyRemoved = removed.filter((x) => (
+        removedKeys.has(normalizeModelName(x)) && !customKeys.has(normalizeModelName(x))
+    ));
+
+    const blocks = [];
+    if (added.length > 0) {
+        const notes = [];
+        if (addedCustom.length > 0) {
+            notes.push(`${formatNoticePatternList(addedCustom)} 此前已在自定义清单中`);
+        }
+        if (addedManuallyRemoved.length > 0) {
+            notes.push(`${formatNoticePatternList(addedManuallyRemoved)} 为手动移除项，继续关闭`);
+        }
+        const noteText = notes.length > 0 ? `；其中 ${notes.join('；')}` : '';
+        blocks.push(`新增 ${added.length} 项：${formatNoticePatternList(added)}${noteText}。`);
+    }
+
+    if (removed.length > 0) {
+        const notes = [];
+        if (removedManuallyAdded.length > 0) {
+            notes.push(`${formatNoticePatternList(removedManuallyAdded)} 为手动添加项，继续保留`);
+        }
+        if (removedManuallyRemoved.length > 0) {
+            notes.push(`${formatNoticePatternList(removedManuallyRemoved)} 此前已由自定义清单移除`);
+        }
+        const noteText = notes.length > 0 ? `；其中 ${notes.join('；')}` : '';
+        blocks.push(`移除 ${removed.length} 项：${formatNoticePatternList(removed)}${noteText}。`);
+    }
+
+    return blocks.join('<br>');
+}
+
+/* 页面加载后检查一次内置清单变化；首次安装只记录快照，不提示 */
+function checkBuiltinListUpdateOnce() {
+    if (builtinUpdateChecked) return;
+
+    try {
+        const context = getStContext();
+        if (!context || !context.extensionSettings) return;
+
+        const previous = getBuiltinSnapshot(context);
+        if (previous === null) {
+            builtinUpdateChecked = true;
+            saveBuiltinSnapshot(context);
+            return;
+        }
+
+        const diff = getBuiltinListDiff(previous, MODEL_PATTERNS);
+        if (diff.added.length === 0 && diff.removed.length === 0) {
+            builtinUpdateChecked = true;
+            if (JSON.stringify(previous) !== JSON.stringify(MODEL_PATTERNS)) {
+                saveBuiltinSnapshot(context);
+            }
+            return;
+        }
+
+        const toastr = window.toastr;
+        if (!toastr || typeof toastr.info !== 'function') return;
+
+        const { custom, removed } = getModelListStored();
+        const message = formatBuiltinListUpdateMessage(previous, MODEL_PATTERNS, custom, removed);
+        if (!message) return;
+
+        builtinUpdateChecked = true;
+        toastr.info(message, BUILTIN_UPDATE_TOAST_TITLE, {
+            timeOut: 12000,
+            extendedTimeOut: 5000,
+            closeButton: true,
+            progressBar: true,
+            /* ST 默认转义 HTML；此处仅含内置型号，关闭转义以渲染分段换行 */
+            escapeHtml: false,
+        });
+        saveBuiltinSnapshot(context);
+    } catch (error) {
+        logWarn('检查内置清单更新提示失败', error);
+    }
+}
+
+/* ST 清理钩子：只删除本插件的设置，不影响其他扩展保存的数据 */
+function cleanExtensionData() {
+    const context = getStContext();
+    if (!context || !context.extensionSettings) {
+        return;
+    }
+
+    delete context.extensionSettings[PLUGIN_KEY];
+}
+
+export { cleanExtensionData };
 
 /* 清洗用户输入：返回 { lines, fixes, issues }；issues 非空时需用户确认 */
 function normalizeModelListInput(text) {
@@ -239,38 +470,227 @@ function appendPopupList(parent, items) {
     applyPopupListAlign(list);
 }
 
-/* 构造弹窗正文：标题、说明与可调整高度的清单输入框 */
-function buildModelListDialogContent(initialText) {
+/* 按「小标题 + 正文 / 列表」构造使用说明的一个分段 */
+function appendUsageHelpSection(parent, section) {
+    const block = document.createElement('section');
+    block.className = 'flex-container flexFlowColumn';
+    block.style.gap = '0.4em';
+
+    const heading = document.createElement('h4');
+    heading.className = 'margin0';
+    heading.textContent = section.heading;
+    block.appendChild(heading);
+
+    for (const text of section.paragraphs || []) {
+        const paragraph = document.createElement('p');
+        paragraph.className = 'margin0';
+        paragraph.style.lineHeight = '1.55';
+        paragraph.textContent = text;
+        block.appendChild(paragraph);
+    }
+
+    if (Array.isArray(section.items) && section.items.length > 0) {
+        const list = document.createElement('ul');
+        list.style.margin = '0';
+        list.style.paddingLeft = '1.25em';
+        list.style.lineHeight = '1.55';
+        for (const text of section.items) {
+            const item = document.createElement('li');
+            item.textContent = text;
+            item.style.marginBottom = '0.3em';
+            list.appendChild(item);
+        }
+        block.appendChild(list);
+    }
+
+    parent.appendChild(block);
+}
+
+/* 构造使用说明正文；只使用 ST 原生排版类，滚动交给弹窗内容区 */
+function buildUsageHelpDialogContent() {
+    const content = document.createElement('div');
+    content.className = 'flex-container flexFlowColumn';
+    content.style.gap = '1em';
+    content.style.paddingBottom = '0.25em';
+
+    const title = document.createElement('h3');
+    title.className = 'margin0 textAlignCenter';
+    title.textContent = `使用说明`;
+    content.appendChild(title);
+
+    for (const section of USAGE_HELP_SECTIONS) {
+        appendUsageHelpSection(content, section);
+    }
+
+    return content;
+}
+
+/* 打开使用说明弹窗；正文过长时由 ST 原生竖向滚动区域显示进度条 */
+async function openUsageHelpDialog() {
+    if (usageHelpOpen) return;
+
+    const context = getStContext();
+    if (!context || !context.POPUP_TYPE || !context.POPUP_RESULT) {
+        logWarn('无法打开使用说明：ST 弹窗组件不可用');
+        return;
+    }
+
+    const PopupClass = context.Popup
+        || (window.SillyTavern && window.SillyTavern.libs && window.SillyTavern.libs.Popup);
+    if (typeof PopupClass !== 'function') {
+        logWarn('无法打开使用说明：ST Popup 类不可用');
+        return;
+    }
+
+    usageHelpOpen = true;
+    try {
+        const popup = new PopupClass(
+            buildUsageHelpDialogContent(),
+            context.POPUP_TYPE.TEXT,
+            '',
+            {
+                wide: true,
+                /* 桌面按内容自然收缩；窄屏保留大弹窗，避免说明区域过于拥挤 */
+                large: window.innerWidth <= 768,
+                leftAlign: true,
+                allowVerticalScrolling: true,
+                okButton: false,
+                cancelButton: false,
+                defaultResult: context.POPUP_RESULT.NEGATIVE,
+                customButtons: [
+                    {
+                        text: '关闭',
+                        result: context.POPUP_RESULT.NEGATIVE,
+                    },
+                ],
+            },
+        );
+        await popup.show();
+    } finally {
+        usageHelpOpen = false;
+    }
+}
+
+/* 构造弹窗正文：模型清单与自定义补充消息设置 */
+function buildModelListDialogContent(initialText, customContentState) {
     const content = document.createElement('div');
     content.className = 'flex-container flexFlowColumn height100p';
 
+    const titleRow = document.createElement('div');
+    titleRow.className = 'flex-container';
+    titleRow.style.alignItems = 'center';
+    titleRow.style.justifyContent = 'center';
+    titleRow.style.gap = '0.4em';
+
     const title = document.createElement('h3');
-    title.className = 'margin0 flex-container flexFlowColumn textAlignCenter';
+    title.className = 'margin0 textAlignCenter';
     title.textContent = PLUGIN_DISPLAY_NAME;
+
+    const helpButton = document.createElement('button');
+    helpButton.type = 'button';
+    helpButton.id = HELP_BUTTON_ID;
+    helpButton.className = 'fa-solid fa-circle-question note-link-span';
+    helpButton.title = '查看使用说明';
+    helpButton.setAttribute('aria-label', '查看使用说明');
+    helpButton.style.border = '0';
+    helpButton.style.padding = '0';
+    helpButton.style.margin = '0';
+    helpButton.style.background = 'transparent';
+    helpButton.style.lineHeight = '1';
+    helpButton.style.fontSize = '0.95em';
+    helpButton.style.transform = 'translateY(0.8px)';
+    helpButton.style.cursor = 'pointer';
+    helpButton.style.flex = '0 0 auto';
+    helpButton.addEventListener('click', () => {
+        void openUsageHelpDialog();
+    });
+    titleRow.append(title, helpButton);
 
     const area = document.createElement('div');
     area.className = 'flex1 flex-container flexFlowColumn';
 
     const hint = document.createElement('h4');
     hint.className = 'margin0';
-    hint.textContent = '生效模型清单（每行一个，保存生效，无需刷新）';
+    hint.textContent = '生效模型清单（每行一个，保存生效）';
 
     const textarea = document.createElement('textarea');
     textarea.id = MODEL_LIST_INPUT_ID;
     textarea.className = 'text_pole';
-    textarea.placeholder = '示例：\ngemini-3.7-flash\ngemini-3.8-flash\ngemini-4-argon';
+    textarea.placeholder = '例如：\ngemini-3.7-flash\ngemini-3.8-flash\ngemini-4-argon';
     textarea.spellcheck = false;
     textarea.value = initialText;
     /* 保留较高的默认高度和下方空间，并允许用户拖拽调整 */
-    textarea.style.height = '60vh';
+    textarea.style.height = '42vh';
     textarea.style.minHeight = '8em';
     textarea.style.maxHeight = '75vh';
 
     area.appendChild(hint);
     area.appendChild(textarea);
-    content.appendChild(title);
+
+    const customSection = document.createElement('div');
+    customSection.className = 'flex-container flexFlowColumn';
+    customSection.style.marginTop = '0.75em';
+
+    const customHeading = document.createElement('h4');
+    customHeading.className = 'margin0';
+    customHeading.style.display = 'flex';
+    customHeading.style.justifyContent = 'center';
+    customHeading.style.alignItems = 'center';
+    const customLabel = document.createElement('label');
+    customLabel.style.display = 'inline-flex';
+    customLabel.style.alignItems = 'center';
+    customLabel.style.gap = '0.35em';
+    customLabel.style.cursor = 'pointer';
+    const customToggle = document.createElement('input');
+    customToggle.type = 'checkbox';
+    customToggle.id = CUSTOM_CONTENT_TOGGLE_ID;
+    customToggle.checked = !!(customContentState && customContentState.enabled);
+    customToggle.style.margin = '0';
+    customToggle.style.flex = '0 0 auto';
+    customToggle.style.transform = 'translateY(0.3px)';
+    customLabel.append(
+        customToggle,
+        '自定义补充消息内容（勾选启用）',
+    );
+    customHeading.appendChild(customLabel);
+
+    const customInput = document.createElement('textarea');
+    customInput.id = CUSTOM_CONTENT_INPUT_ID;
+    customInput.className = 'text_pole';
+    customInput.rows = window.innerWidth <= 768 ? 4 : 3;
+    customInput.spellcheck = false;
+    customInput.placeholder = '补充末尾 user 消息时，使用此处内容替换默认零宽空格。内容会实际发给 AI，请注意语义影响。\n例如：Continue、继续';
+    customInput.value = customContentState && typeof customContentState.content === 'string'
+        ? customContentState.content
+        : '';
+
+    const updateCustomInputState = () => {
+        const enabled = customToggle.checked;
+        customInput.disabled = !enabled;
+        if (enabled) {
+            customInput.style.removeProperty('background-color');
+        } else {
+            customInput.style.setProperty(
+                'background-color',
+                'color-mix(in srgb, var(--SmartThemeBlurTintColor) 78%, var(--SmartThemeBodyColor) 22%)',
+                'important',
+            );
+        }
+        /* 主题默认的 brightness(0.5) 会把自适应灰色再次压暗，禁用态改用背景色表达 */
+        customInput.style.filter = enabled ? '' : 'none';
+    };
+    customToggle.addEventListener('change', () => {
+        updateCustomInputState();
+    });
+    updateCustomInputState();
+
+    customSection.appendChild(customHeading);
+    customSection.appendChild(customInput);
+    area.appendChild(customSection);
+
+    content.appendChild(titleRow);
     content.appendChild(area);
-    return { content, textarea };
+    return { content, textarea, customToggle, customInput };
 }
 
 /* 校验清单，并在超限、空清单或存在问题等情况下提示用户；返回是否允许保存 */
@@ -392,74 +812,59 @@ async function openModelListDialog() {
 
     const popupType = context.POPUP_TYPE;
     const resultTypes = context.POPUP_RESULT;
-    /* 已保存内容；取消或校验失败后恢复为它 */
-    let savedText = getModelListText();
-    let initialText = savedText;
+    const parts = buildModelListDialogContent(getModelListText(), getCustomContentStored());
+    let savePending = false;
 
-    while (true) {
-        const parts = buildModelListDialogContent(initialText);
-        /* null：正常关闭；restore：恢复默认；cancel：取消或拒绝确认 */
-        let closingWithResult = null;
-        /* 是否正在等待保存校验 */
-        let savePending = false;
-
-        const popup = new PopupClass(parts.content, popupType.TEXT, '', {
-            wide: true,
-            large: true,
-            allowVerticalScrolling: true,
-            okButton: false,
-            cancelButton: false,
-            customButtons: [
-                { text: '保存', classes: ['popup-button-ok'], action: () => { savePending = true; popup.completeAffirmative(); } },
-                { text: '取消', classes: ['popup-button-cancel'], result: resultTypes.NEGATIVE, appendAtEnd: true },
-                { text: '恢复默认', action: () => { void handleRestore(); }, appendAtEnd: true },
-            ],
-            onClosing: async (instance) => {
-                /* 保存前校验；不通过时保持弹窗并保留输入 */
-                if (savePending) {
-                    const ok = await confirmModelListIssues(parts.textarea.value);
-                    if (!ok) {
-                        savePending = false;
-                        return false;
-                    }
-                    closingWithResult = resultTypes.AFFIRMATIVE;
+    /* 不启用 large 固定高度：由内容决定初始尺寸，拖大后再使用原生竖向滚动 */
+    const popup = new PopupClass(parts.content, popupType.TEXT, '', {
+        wide: true,
+        allowVerticalScrolling: true,
+        okButton: false,
+        cancelButton: false,
+        customButtons: [
+            { text: '保存', classes: ['popup-button-ok'], action: () => { savePending = true; popup.completeAffirmative(); } },
+            { text: '取消', classes: ['popup-button-cancel'], result: resultTypes.NEGATIVE, appendAtEnd: true },
+            { text: '恢复默认', action: () => { void handleRestore(); }, appendAtEnd: true },
+        ],
+        onClosing: async () => {
+            /* 保存前校验；不通过时保持弹窗并保留输入 */
+            if (savePending) {
+                const ok = await confirmModelListIssues(parts.textarea.value);
+                if (!ok) {
+                    savePending = false;
+                    return false;
                 }
-                return true;
-            },
-        });
-
-        const handleRestore = async () => {
-            const ctx = getStContext() || context;
-            const confirmed = await ctx.callGenericPopup(
-                '将清空自定义条目，并恢复内置清单。确定恢复吗？',
-                popupType.CONFIRM,
-                '',
-                { okButton: '确定', cancelButton: '取消' },
-            );
-            if (confirmed !== resultTypes.AFFIRMATIVE) return;
-            closingWithResult = 'restore';
-            await popup.completeCancelled();
-        };
-
-        await popup.show();
-
-        if (closingWithResult === 'restore') {
-            /* 恢复默认后重新打开弹窗，等待用户确认保存 */
-            initialText = MODEL_PATTERNS.join('\n');
-            continue;
-        }
-
-        if (closingWithResult === resultTypes.AFFIRMATIVE) {
-            const info = normalizeModelListInput(parts.textarea.value);
-            const saved = saveModelListSettings(info.lines);
-            if (!saved) {
-                logWarn('保存模型清单失败：ST 设置接口不可用');
             }
-            savedText = info.lines.join('\n');
-            return;
-        }
+            return true;
+        },
+    });
 
-        return;
+    const handleRestore = async () => {
+        const ctx = getStContext() || context;
+        const confirmed = await ctx.callGenericPopup(
+            '将清空自定义条目，并恢复内置清单。确定恢复吗？',
+            popupType.CONFIRM,
+            '',
+            { okButton: '确定', cancelButton: '取消' },
+        );
+        if (confirmed !== resultTypes.AFFIRMATIVE) return;
+
+        /* 原地填入内置清单，仍需用户点「保存」才写回设置 */
+        parts.textarea.value = MODEL_PATTERNS.join('\n');
+        parts.textarea.focus();
+    };
+
+    const result = await popup.show();
+    if (result === resultTypes.AFFIRMATIVE) {
+        const info = normalizeModelListInput(parts.textarea.value);
+        const saved = saveModelListSettings(
+            info.lines,
+            parts.customToggle.checked,
+            parts.customInput.value,
+        );
+        if (!saved) {
+            logWarn('保存模型清单失败：ST 设置接口不可用');
+        }
     }
 }
 
@@ -513,6 +918,15 @@ let iframeHooksInstalled = false;
 let iframeHookCount = 0;
 /* 最近一次请求的简要判断结果 */
 let lastDecision = null;
+/* 最近一次请求正文描述摘要（不持有正文或大对象引用） */
+let lastBodyDescriptor = null;
+/* 请求正文处理计数，供测试验证没有重复读取、解析或分析 */
+const requestPipelineStats = {
+    requestReads: 0,
+    jsonParses: 0,
+    analyses: 0,
+    modifications: 0,
+};
 /* 启动成功提示是否已输出过 */
 let startupLogged = false;
 
@@ -636,6 +1050,57 @@ function isJsonContentType(contentType) {
     if (!contentType) return true;
     const lower = String(contentType).toLowerCase();
     return lower.includes('application/json') || lower.includes('+json');
+}
+
+/* 返回不支持按 JSON/普通对象处理的正文原因；null 表示可以继续判断。
+   这里只做类型识别，不读取、不枚举、不转换二进制或表单正文。 */
+function getUnsupportedBodyReason(value) {
+    if (value === '') return 'empty-body';
+    if (Array.isArray(value)) return 'array-body';
+    if (typeof value !== 'object' || value === null) return 'non-object-body';
+
+    let tag = '';
+    try {
+        tag = Object.prototype.toString.call(value);
+    } catch (error) {
+        return 'body-classification-failed';
+    }
+    if (tag === '[object Blob]' || tag === '[object File]') return 'blob-body';
+    if (tag === '[object FormData]') return 'form-data-body';
+    if (tag === '[object URLSearchParams]') return 'url-search-params-body';
+    if (tag === '[object ArrayBuffer]') return 'array-buffer-body';
+    if (tag === '[object DataView]') return 'data-view-body';
+    if (tag === '[object ReadableStream]') return 'readable-stream-body';
+    try {
+        if (ArrayBuffer.isView(value)) return 'typed-array-body';
+    } catch (error) {
+        return 'body-classification-failed';
+    }
+    if (tag !== '[object Object]') return 'unsupported-object-body';
+    return null;
+}
+
+/* 构造请求正文描述；valuePromise 只用于尚未读取的 Request 正文。 */
+function makeBodyDescriptor(state, origin, value, options = {}) {
+    return {
+        state,
+        origin,
+        value,
+        valuePromise: options.valuePromise || null,
+        hasRawText: options.hasRawText === true,
+        unsupportedReason: options.unsupportedReason || null,
+    };
+}
+
+/* 生成只含分类字段的正文摘要，避免调试接口长期持有请求正文。 */
+function summarizeBodyDescriptor(descriptor) {
+    if (!descriptor) return null;
+    return {
+        state: descriptor.state,
+        origin: descriptor.origin,
+        hasRawText: !!descriptor.hasRawText,
+        unsupportedReason: descriptor.unsupportedReason || '',
+    };
 }
 
 function safeDecodeURIComponent(value) {
@@ -763,8 +1228,9 @@ function selectTargetArray(body, requestUrl) {
 
 /* ── 请求体分析与修改 ─────────────────── */
 
-/* 分析已解析的 JSON 请求体，只做判断，不修改 */
-function analyzeParsedBody(body, requestUrl) {
+/* 分析已解析的 JSON 请求体，只做判断，不修改；纯检查可关闭计数。 */
+function analyzeParsedBody(body, requestUrl, trackStats = true) {
+    if (trackStats) requestPipelineStats.analyses++;
     const modelInfo = getModelInfo(body, requestUrl);
     if (!modelInfo.matched) {
         return {
@@ -824,14 +1290,15 @@ function analyzeParsedBody(body, requestUrl) {
     };
 }
 
-/* 返回追加单空格 user 消息后的新请求体，不修改传入对象 */
+/* 返回追加 user 消息后的新请求体，不修改传入对象 */
 function buildFixedBody(body, target) {
+    const placeholderText = getEffectivePlaceholderText();
     if (target === 'messages') {
         return {
             ...body,
             messages: [
                 ...body.messages,
-                { role: 'user', content: PLACEHOLDER_TEXT },
+                { role: 'user', content: placeholderText },
             ],
         };
     }
@@ -840,117 +1307,188 @@ function buildFixedBody(body, target) {
         ...body,
         contents: [
             ...body.contents,
-            { role: 'user', parts: [{ text: PLACEHOLDER_TEXT }] },
+            { role: 'user', parts: [{ text: placeholderText }] },
         ],
     };
 }
 
-/* 读取本次 fetch 实际生效的请求体文本 */
-async function readEffectiveRequestBody(input, init) {
-    if (init && Object.prototype.hasOwnProperty.call(init, 'body')) {
-        if (typeof init.body === 'string') {
-            return { ok: true, text: init.body, source: 'init.body' };
+/* 读取本次 fetch 实际生效的正文来源；这里只分类，不读取 Request 内容。 */
+function readFetchBodySource(input, init) {
+    /* 读取本身属于执行异常；保留外层 modification-failed 回退语义。 */
+    const body = init ? init.body : undefined;
+
+    if (body !== undefined && body !== null) {
+        if (typeof body === 'string') {
+            if (body.length === 0) {
+                return makeBodyDescriptor('unsupported', 'init-string', body, {
+                    unsupportedReason: 'empty-body',
+                });
+            }
+            return makeBodyDescriptor('text', 'init-string', body, { hasRawText: true });
         }
-        return { ok: false, reason: 'init.body 不是字符串' };
+        const unsupportedReason = getUnsupportedBodyReason(body);
+        if (unsupportedReason) {
+            return makeBodyDescriptor('unsupported', 'init-body', body, { unsupportedReason });
+        }
+        return makeBodyDescriptor('structured-object', 'init-object', body);
     }
 
     if (!isRequestLike(input)) {
-        return { ok: false, reason: '输入不是 Request 且 init.body 不可用' };
+        return makeBodyDescriptor('none', 'none', null);
     }
 
+    let valuePromise;
     try {
         const clonedRequest = input.clone();
-        const text = await clonedRequest.text();
-        return { ok: true, text, source: 'request.body' };
+        valuePromise = clonedRequest.text()
+            .then((text) => {
+                requestPipelineStats.requestReads++;
+                return typeof text === 'string' ? text : null;
+            })
+            .catch(() => null);
     } catch (error) {
-        return { ok: false, reason: 'Request body 无法 clone 或读取' };
+        valuePromise = Promise.resolve(null);
     }
+    return makeBodyDescriptor('text', 'request-text', null, { valuePromise });
 }
 
-/* 用修改后的文本构造新的 fetch init，只覆盖 body */
-function buildModifiedInit(init, bodyText) {
-    if (init && typeof init === 'object') {
-        return { ...init, body: bodyText };
+/* 将正文描述转换为可分析的普通对象；Request 文本最多读取一次。 */
+async function materializeFetchBody(descriptor) {
+    if (!descriptor || descriptor.state === 'none') {
+        return { ok: false, reason: '请求没有可用正文' };
     }
-    return { body: bodyText };
+    if (descriptor.state === 'unsupported') {
+        return { ok: false, reason: `正文类型不支持：${descriptor.unsupportedReason || 'unknown'}` };
+    }
+    if (descriptor.state === 'structured-object') {
+        return { ok: true, body: descriptor.value, rawText: null };
+    }
+
+    let rawText = descriptor.value;
+    if (typeof rawText !== 'string' && descriptor.valuePromise) {
+        rawText = await descriptor.valuePromise;
+    }
+    if (typeof rawText !== 'string') {
+        return { ok: false, reason: 'Request body 无法 clone 或读取' };
+    }
+    if (rawText.length === 0) {
+        return { ok: false, reason: '正文类型不支持：empty-body' };
+    }
+
+    let body;
+    requestPipelineStats.jsonParses++;
+    try {
+        body = JSON.parse(rawText);
+    } catch (error) {
+        return { ok: false, reason: '请求体不是合法 JSON' };
+    }
+    if (!isPlainObject(body)) {
+        return { ok: false, reason: '请求体 JSON 顶层不是普通对象' };
+    }
+    return { ok: true, body, rawText };
+}
+
+/* 生成正文不支持时的统一计划。 */
+function makeUnsupportedPlan(requestUrl, reason, descriptor = null, options = {}) {
+    const summary = summarizeBodyDescriptor(descriptor);
+    return {
+        changed: false,
+        decision: options.decision || 'unsupported-body',
+        reason,
+        url: requestUrl,
+        body: null,
+        bodyState: summary ? summary.state : '',
+        bodyOrigin: summary ? summary.origin : '',
+        unsupportedReason: summary ? summary.unsupportedReason : '',
+        errorStage: options.errorStage || '',
+        errorMessage: options.errorMessage || '',
+    };
+}
+
+/* 分析已解析正文并产出唯一修改计划；文本正文同时预生成替换字符串。 */
+function planParsedBodyModification(body, requestUrl, options = {}) {
+    const trackStats = options.trackStats !== false;
+    const analysis = analyzeParsedBody(body, requestUrl, trackStats);
+    const plan = {
+        ...analysis,
+        changed: false,
+        url: requestUrl,
+        body,
+        rawText: options.rawText || null,
+        bodyState: options.bodyState || '',
+        bodyOrigin: options.bodyOrigin || '',
+        replacementBody: null,
+        fixedBodyText: null,
+    };
+    if (analysis.decision !== 'needs-fix') return plan;
+
+    const fixedBody = buildFixedBody(body, analysis.target);
+    let replacementBody = fixedBody;
+    let fixedBodyText = null;
+    if (options.bodyState === 'text') {
+        fixedBodyText = JSON.stringify(fixedBody);
+        replacementBody = fixedBodyText;
+    }
+    if (trackStats) requestPipelineStats.modifications++;
+    return {
+        ...plan,
+        changed: true,
+        decision: 'fixed',
+        body: fixedBody,
+        replacementBody,
+        fixedBodyText,
+    };
+}
+
+/* 用修改后的正文构造新的 fetch init，只覆盖 body。 */
+function buildModifiedInit(init, bodyValue) {
+    if (init && typeof init === 'object') {
+        return { ...init, body: bodyValue };
+    }
+    return { body: bodyValue };
 }
 
 /* 分析并构造修改后的请求参数；任何无法安全完成的情况都返回 changed:false */
 async function buildModifiedFetchArgs(input, init) {
+    lastBodyDescriptor = null;
     const requestUrl = getFetchRequestUrl(input);
     const method = getEffectiveMethod(input, init);
 
     if (!JSON_BODY_METHODS.has(method)) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: `method ${method} 不是 JSON 写请求`,
-            url: requestUrl,
-        };
+        return makeUnsupportedPlan(requestUrl, `method ${method} 不是 JSON 写请求`);
     }
 
     const contentType = getEffectiveContentType(input, init);
     if (!isJsonContentType(contentType)) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: `Content-Type ${contentType} 不是 JSON`,
-            url: requestUrl,
-        };
+        return makeUnsupportedPlan(requestUrl, `Content-Type ${contentType} 不是 JSON`);
     }
 
-    const bodyRead = await readEffectiveRequestBody(input, init);
+    const descriptor = readFetchBodySource(input, init);
+    lastBodyDescriptor = summarizeBodyDescriptor(descriptor);
+    if (descriptor.state === 'none' || descriptor.state === 'unsupported') {
+        return makeUnsupportedPlan(
+            requestUrl,
+            descriptor.state === 'none'
+                ? '输入不是 Request 且没有可用正文'
+                : `正文类型不支持：${descriptor.unsupportedReason || 'unknown'}`,
+            descriptor,
+        );
+    }
+
+    const bodyRead = await materializeFetchBody(descriptor);
     if (!bodyRead.ok) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: bodyRead.reason,
-            url: requestUrl,
-        };
+        return makeUnsupportedPlan(requestUrl, bodyRead.reason, descriptor);
     }
 
-    let body;
-    try {
-        body = JSON.parse(bodyRead.text);
-    } catch (error) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: '请求体不是合法 JSON',
-            url: requestUrl,
-        };
+    const plan = planParsedBodyModification(bodyRead.body, requestUrl, {
+        rawText: bodyRead.rawText,
+        bodyState: descriptor.state,
+        bodyOrigin: descriptor.origin,
+    });
+    if (plan.changed) {
+        plan.modifiedInit = buildModifiedInit(init, plan.replacementBody);
     }
-
-    if (!isPlainObject(body)) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: '请求体 JSON 顶层不是普通对象',
-            url: requestUrl,
-        };
-    }
-
-    const analysis = analyzeParsedBody(body, requestUrl);
-    if (analysis.decision !== 'needs-fix') {
-        return {
-            ...analysis,
-            changed: false,
-            url: requestUrl,
-            body,
-        };
-    }
-
-    const fixedBody = buildFixedBody(body, analysis.target);
-    const fixedBodyText = JSON.stringify(fixedBody);
-
-    return {
-        ...analysis,
-        changed: true,
-        decision: 'fixed',
-        url: requestUrl,
-        body: fixedBody,
-        modifiedInit: buildModifiedInit(init, fixedBodyText),
-    };
+    return plan;
 }
 
 /* 供调试接口使用的纯检查函数，不发送请求 */
@@ -1001,19 +1539,11 @@ function inspectRequestBody(bodyOrText, requestUrl) {
         };
     }
 
-    const analysis = analyzeParsedBody(body, requestUrl || '');
-    if (analysis.decision !== 'needs-fix') {
-        return { ...analysis, url: requestUrl || '', body };
-    }
-
-    const fixedBody = buildFixedBody(body, analysis.target);
-    return {
-        ...analysis,
-        changed: true,
-        decision: 'fixed',
-        url: requestUrl || '',
-        body: fixedBody,
-    };
+    return planParsedBodyModification(body, requestUrl || '', {
+        bodyState: typeof bodyOrText === 'string' ? 'text' : 'structured-object',
+        bodyOrigin: typeof bodyOrText === 'string' ? 'inspect-string' : 'inspect-object',
+        trackStats: false,
+    });
 }
 
 /* 生成可安全保存和打印的简要判断结果 */
@@ -1031,6 +1561,9 @@ function summarizeDecision(plan) {
         target: plan.target || null,
         lastRole: plan.lastRole || '',
         changed: !!plan.changed,
+        bodyState: plan.bodyState || '',
+        bodyOrigin: plan.bodyOrigin || '',
+        unsupportedReason: plan.unsupportedReason || '',
         errorStage: plan.errorStage || '',
         error: plan.errorMessage || '',
     };
@@ -1131,53 +1664,66 @@ function resolveRealmUrl(realmWindow, url) {
     }
 }
 
+/* 对 XHR 正文做同步分类；不读取或枚举二进制、表单与流内容。 */
+function readXhrBodySource(body) {
+    if (body === undefined || body === null) {
+        return makeBodyDescriptor('none', 'xhr-none', null);
+    }
+    if (typeof body === 'string') {
+        if (body.length === 0) {
+            return makeBodyDescriptor('unsupported', 'xhr-text', body, {
+                unsupportedReason: 'empty-body',
+            });
+        }
+        return makeBodyDescriptor('text', 'xhr-text', body, { hasRawText: true });
+    }
+    const unsupportedReason = getUnsupportedBodyReason(body);
+    if (unsupportedReason) {
+        return makeBodyDescriptor('unsupported', 'xhr-body', body, { unsupportedReason });
+    }
+    return makeBodyDescriptor('structured-object', 'xhr-object', body);
+}
+
 /* 同步构造 XHR 请求体的修改方案；发送方法是同步的，不能复用异步 fetch 流程。
-   判断条件与 fetch 一致，无法安全修改时返回 changed:false */
-function planXhrBodyModification(requestUrl, method, bodyText) {
+   判断条件与 fetch 一致，无法安全修改时返回 changed:false。 */
+function planXhrBodyModification(requestUrl, method, bodyValue) {
+    lastBodyDescriptor = null;
     if (!JSON_BODY_METHODS.has(method)) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: `method ${method} 不是 JSON 写请求`,
-            url: requestUrl,
-        };
+        return makeUnsupportedPlan(requestUrl, `method ${method} 不是 JSON 写请求`);
+    }
+
+    const descriptor = readXhrBodySource(bodyValue);
+    lastBodyDescriptor = summarizeBodyDescriptor(descriptor);
+    if (descriptor.state === 'none' || descriptor.state === 'unsupported') {
+        return makeUnsupportedPlan(
+            requestUrl,
+            descriptor.state === 'none'
+                ? '请求没有可用正文'
+                : `正文类型不支持：${descriptor.unsupportedReason || 'unknown'}`,
+            descriptor,
+        );
     }
 
     let body;
-    try {
-        body = JSON.parse(bodyText);
-    } catch (error) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: '请求体不是合法 JSON',
-            url: requestUrl,
-        };
+    if (descriptor.state === 'text') {
+        requestPipelineStats.jsonParses++;
+        try {
+            body = JSON.parse(descriptor.value);
+        } catch (error) {
+            return makeUnsupportedPlan(requestUrl, '请求体不是合法 JSON', descriptor);
+        }
+        if (!isPlainObject(body)) {
+            return makeUnsupportedPlan(requestUrl, '请求体 JSON 顶层不是普通对象', descriptor);
+        }
+    } else {
+        body = descriptor.value;
     }
 
-    if (!isPlainObject(body)) {
-        return {
-            changed: false,
-            decision: 'unsupported-body',
-            reason: '请求体 JSON 顶层不是普通对象',
-            url: requestUrl,
-        };
-    }
-
-    const analysis = analyzeParsedBody(body, requestUrl);
-    if (analysis.decision !== 'needs-fix') {
-        return { ...analysis, changed: false, url: requestUrl, body };
-    }
-
-    const fixedBody = buildFixedBody(body, analysis.target);
-    return {
-        ...analysis,
-        changed: true,
-        decision: 'fixed',
-        url: requestUrl,
-        body: fixedBody,
-        fixedBodyText: JSON.stringify(fixedBody),
-    };
+    return planParsedBodyModification(body, requestUrl, {
+        rawText: descriptor.state === 'text' ? descriptor.value : null,
+        bodyState: descriptor.state,
+        bodyOrigin: descriptor.origin,
+    });
 }
 
 /* 给单个 realm 安装 XHR 包装：open 记录请求信息，send 同步判断并按需替换 body。
@@ -1215,16 +1761,19 @@ function installRealmXhrHook(realmWindow) {
     const hookedSend = function hookedXhrSend(body) {
         if (!ENABLED) return originalSend.apply(this, arguments);
 
-        /* 需要修改时的请求文本；null 表示按原参数发送 */
-        let modifiedBodyText = null;
+        /* 修改后的请求正文；未修改时保留原参数直接发送 */
+        let replacementBody = null;
+        let shouldReplaceBody = false;
         let meta = null;
         try {
             meta = xhrOpenMeta.get(this);
-            /* 只处理字符串 body：Blob、FormData、ArrayBuffer 等无法安全改写，原样放行 */
-            if (typeof body === 'string' && body && meta && JSON_BODY_METHODS.has(meta.method)) {
+            if (meta && JSON_BODY_METHODS.has(meta.method)) {
                 const plan = planXhrBodyModification(meta.url, meta.method, body);
                 recordDecision(plan);
-                if (plan.changed) modifiedBodyText = plan.fixedBodyText;
+                if (plan.changed) {
+                    replacementBody = plan.replacementBody;
+                    shouldReplaceBody = true;
+                }
             }
         } catch (error) {
             /* 保护逻辑自身异常：放弃修改，原样发送（不重复发送） */
@@ -1238,9 +1787,9 @@ function installRealmXhrHook(realmWindow) {
             });
         }
 
-        if (modifiedBodyText === null) return originalSend.apply(this, arguments);
-        /* 使用修改后的文本发送；原 send 抛错时保持原异常，不重发 */
-        return originalSend.call(this, modifiedBodyText);
+        if (!shouldReplaceBody) return originalSend.apply(this, arguments);
+        /* 文本使用修改后的字符串，普通对象继续保留对象形式；原 send 抛错时保持原异常，不重发 */
+        return originalSend.call(this, replacementBody);
     };
 
     try {
@@ -1375,6 +1924,14 @@ function installIframeRequestHooks() {
 window.__PrefillCompatFix = {
     inspect: inspectRequestBody,
     getLastDecision: () => lastDecision,
+    getLastBodyDescriptor: () => (lastBodyDescriptor ? { ...lastBodyDescriptor } : null),
+    getRequestPipelineStats: () => ({ ...requestPipelineStats }),
+    resetRequestPipelineStats: () => {
+        requestPipelineStats.requestReads = 0;
+        requestPipelineStats.jsonParses = 0;
+        requestPipelineStats.analyses = 0;
+        requestPipelineStats.modifications = 0;
+    },
     getModelList: () => ({
         effective: getEffectiveModelPatterns(),
         builtin: MODEL_PATTERNS.slice(),
@@ -1413,6 +1970,7 @@ function installAllHooks() {
     installMainRequestHooks();
     installIframeRequestHooks();
     installModelListLinkWithRetry();
+    checkBuiltinListUpdateOnce();
     logStartupOnce();
 }
 
